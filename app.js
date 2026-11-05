@@ -102,10 +102,85 @@
     SELECTORS.picker.value = state.data.regions[previous] ? previous : "";
     if (!SELECTORS.picker.value) state.selected = "";
   }
+  // Источник содержит не только агрегаты regions[key].w, но и опубликованные
+  // сообщения regions[key].ev. Показываем региональные предупреждения и инциденты,
+  // но не сообщения о предполагаемых маршрутах или текущих позициях БПЛА.
+  const DISPLAY_EVENT_TYPES = { alert: "Предупреждение", incident: "Сообщение об инциденте" };
+  function parseMoscowTime(value) {
+    if (!value) return NaN;
+    const raw = String(value).trim();
+    const ts = Date.parse(/(?:Z|[+-]\d\d:?\d\d)$/i.test(raw) ? raw : raw + "+03:00");
+    return Number.isFinite(ts) ? ts : NaN;
+  }
+  function displayedEvents() {
+    if (!state.data) return [];
+    const now = parseMoscowTime(state.data.now);
+    const hours = { "1h": 1, "3h": 3, "24h": 24 }[state.period] || 24;
+    const windowValue = state.data.windows && state.data.windows[state.period];
+    const cutoff = parseMoscowTime(windowValue) || (Number.isFinite(now) ? now - hours*3600000 : Date.now() - hours*3600000);
+    const maxTime = Number.isFinite(now) ? now + 15*60000 : Date.now() + 15*60000;
+    const keys = state.selected ? [state.selected] : Object.keys(state.data.regions);
+    const result = [];
+    for (const key of keys) {
+      const region = state.data.regions[key];
+      if (!region || !Array.isArray(region.ev)) continue;
+      for (const ev of region.ev) {
+        const timestamp = parseMoscowTime(ev && ev.t);
+        if (!ev || !Object.hasOwn(DISPLAY_EVENT_TYPES, ev.k) ||
+            !Number.isFinite(timestamp) || timestamp < cutoff || timestamp > maxTime) continue;
+        result.push({ ...ev, key, timestamp });
+      }
+    }
+    return result.sort((a, b) => b.timestamp - a.timestamp);
+  }
+  function formatEventTime(raw) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(raw || ""));
+    return m ? `${m[3]}.${m[2]} ${m[4]}:${m[5]} МСК` : "Время не указано";
+  }
+  function appendEvents(parent, events, maxItems) {
+    const heading = $("h3", "event-heading", "Последние опубликованные сообщения · " + periodName());
+    parent.append(heading);
+    if (!events.length) {
+      parent.append($("p", "secondary", "За выбранный период нет сообщений этих категорий. Это не означает отсутствия угрозы."));
+      return;
+    }
+    const list = $("div", "events-list");
+    for (const ev of events.slice(0, maxItems)) {
+      const card = $("div", "event-card");
+      const meta = $("div", "event-meta");
+      meta.append($("span", "event-date", formatEventTime(ev.t)),
+        $("span", "event-category", DISPLAY_EVENT_TYPES[ev.k]));
+      if (ev.c === "o") meta.append($("span", "event-source-status", "Указан официальный источник"));
+      else meta.append($("span", "event-source-status", "Требует проверки"));
+      card.append(meta);
+      if (!state.selected) card.append($("strong", "event-region", regionName(ev.key)));
+      card.append($("p", "event-content", String(ev.tx || "Текст не указан").slice(0, 320)));
+      const src = Array.isArray(ev.u) ? ev.u.find(u => {
+        try { const x = new URL(u); return x.protocol === "https:"; } catch { return false; }
+      }) : null;
+      if (src) {
+        const link = $("a", "event-source", "Открыть источник ↗");
+        link.href = src;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        card.append(link);
+      }
+      list.append(card);
+    }
+    parent.append(list);
+    if (events.length > maxItems) parent.append($("p", "smallnote", `Показано ${maxItems} из ${events.length} сообщений.`));
+    parent.append($("p", "smallnote", "Подборка из открытого источника БПЛА Фронт. Сообщения могут быть неполными или непроверенными; для предупреждений об опасности используйте официальные каналы."));
+  }
   function renderDetails() {
     SELECTORS.details.replaceChildren();
-    if (!state.selected || !state.data || !state.data.regions[state.selected]) {
-      SELECTORS.details.append($("div", "detail-placeholder", "Нажми на регион на карте или выбери его в списке — покажем сводку сообщений."));
+    if (!state.data) {
+      SELECTORS.details.append($("p", "secondary", "Получаем опубликованные данные…"));
+      return;
+    }
+    if (!state.selected || !state.data.regions[state.selected]) {
+      SELECTORS.details.append($("h2", "", "Все регионы России"),
+        $("p", "secondary", "Выбери регион для его статистики или посмотри последние опубликованные сообщения ниже."));
+      appendEvents(SELECTORS.details, displayedEvents(), 15);
       return;
     }
     const name = regionName(state.selected), c = counts(state.data, state.selected);
@@ -117,7 +192,8 @@
       card.append($("strong", "", n), $("span", "", label));
       grid.append(card);
     }
-    SELECTORS.details.append(grid, $("p", "smallnote", "Числа отражают количество сообщений по региону, а не число отдельных БПЛА или уровень опасности прямо сейчас."));
+    SELECTORS.details.append(grid, $("p", "smallnote", "Показатели — число опубликованных сообщений, не число отдельных БПЛА и не уровень опасности прямо сейчас."));
+    appendEvents(SELECTORS.details, displayedEvents(), 20);
   }
   function renderMap() {
     if (!state.map || !state.data || !window.L) return;
